@@ -1,16 +1,15 @@
-//! InfiniBand Reliable Connection (RC) Ping-Pong Example
+//! InfiniBand Reliable Connection (RC) Cache
 //!
-//! This module implements a ping-pong test using InfiniBand's Reliable Connection (RC) transport.
-//! It demonstrates basic RDMA operations, connection setup, and data exchange in a Rust environment.
-//!
-//! Key features:
-//! - Utilizes InfiniBand verbs for RDMA operations
-//! - Implements both client and server roles
-//! - Measures bandwidth and latency of RDMA communications
-//! - Supports various configuration options including MTU size, iteration count, and more
-//!
-//! This example is valuable for developers learning RDMA programming in Rust or
-//! benchmarking InfiniBand network performance.
+//! Этот модуль реализует глобальный кэш, используя протокол Reliable Connection (RC) от InfiniBand.
+//! Словарь
+//! wc (Work Completions) - завершение работы в CQ
+//! wr (Work Request) - запрос на выполнение RDMA
+//! Completion Queue (CQ) - очередь завершения операций
+//! gid - глобальный идентификатор для IB-порта
+//! SGE (Segment Descriptor)
+//! l-key - локальный ключ доступа к памяти
+//! r-key - удаленный ключ доступа к памяти
+//! Protection Domain (PD)
 
 use std::io::{Error, Read, Write};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
@@ -36,29 +35,31 @@ use byte_unit::{Byte, UnitType};
 const SEND_WR_ID: u64 = 0;
 const RECV_WR_ID: u64 = 1;
 
+const CHUNK_SIZE: usize = 4096;
+
 #[derive(Debug, Parser)]
-#[clap(name = "rc_pingpong", version = "0.1.0")]
+#[clap(name = "rc_cache", version = "0.1.0")]
 pub struct Args {
-    /// Listen on / connect to port
+    /// Прослушивать порт / Подключиться к порту
     #[clap(long, short = 'p', default_value_t = 18515)]
     port: u16,
-    /// The IB device to use
+    /// Устройство IB для использования
     #[clap(long, short = 'd')]
     ib_dev: Option<String>,
-    /// The port of IB device
+    /// Порт устройства IB
     #[clap(long, short = 'i', default_value_t = 1)]
     ib_port: u8,
-    /// The size of message to exchange
-    #[clap(long, short = 's', default_value_t = 1024)]
+    /// Размер сообщения для обмена
+    #[clap(long, short = 's', default_value_t = CHUNK_SIZE)]
     size: u32,
-    /// Path MTU
+    /// MTU (Maximum Transmission Unit) – предельно большой объем информации, который можно единовременно направить через сетевой интерфейс.
     #[clap(long, short = 'm', value_enum, default_value_t = PathMtu(Mtu::Mtu1024))]
     mtu: PathMtu,
-    /// Numbers of receives to post at a time
+    /// Количество сообщений, которые можно отправить за один раз.
     #[clap(long, short = 'r', default_value_t = 500)]
     rx_depth: u32,
-    /// Numbers of exchanges
-    #[clap(long, short = 'n', default_value_t = 1000)]
+    /// Глубина приёмного буфера
+    #[clap(long, short = 'n', default_value_t = 500)]
     iter: u32,
     /// Service level value
     #[clap(long, short = 'l', default_value_t = 0)]
@@ -107,40 +108,24 @@ struct PingPongDestination {
     gid: Gid,
 }
 
-#[derive(Debug, Default)]
-struct TimeStamps {
-    completion_recv_max_time_delta: u64,
-    completion_recv_min_time_delta: u64,
-    completion_recv_total_time_delta: u64,
-    completion_recv_prev_time: u64,
-    last_completion_with_timestamp: u32,
-    completion_with_time_iters: u32,
-}
-
 #[allow(clippy::while_let_on_iterator)] // отключает предупреждение линтера о нерекомендуемом использовании while let на итераторах.
 fn main() -> anyhow::Result<()> {
-
     // ---- Парсинг аргументов и инициализация счётчиков  ----
     let args = Args::parse(); // парсит аргументы командной строки
     let mut scnt: u32 = 0; // счётчики для отправленных пакетов
     let mut rcnt: u32 = 0; // счётчики для полученных пакетов
-    let rx_depth = if args.iter > args.rx_depth { //глубина приёмного буфера (сколько запросов на приём можно держать в очереди)
+    let rx_depth = if args.iter > args.rx_depth {
+        //глубина приёмного буфера (сколько запросов на приём можно держать в очереди)
         args.rx_depth
     } else {
         args.iter
     };
     let mut rout: u32 = 0; // количество активных приёмных запросов
 
-    // ---- Инициализация структуры для хранения временных меток ----
-    let mut ts_param = TimeStamps { // структура для хранения статистики по временным меткам
-        completion_recv_min_time_delta: u64::MAX, // минимальное время между приёмными запросами
-        ..Default::default()
-    };
-    let mut completion_timestamp_mask = 0; //маска для работы с временными метками завершения операций
-
     // ---- Получение списка устройств InfiniBand ----
     let device_list = DeviceList::new().expect("Failed to get IB devices list"); // Получает список IB-устройств.
-    let device = match args.ib_dev { //Если указано имя устройства (args.ib_dev), ищет его, иначе берёт первое доступное.
+    let device = match args.ib_dev {
+        //Если указано имя устройства (args.ib_dev), ищет его, иначе берёт первое доступное.
         Some(ib_dev) => device_list
             .iter()
             .find(|dev| dev.name().eq(&ib_dev))
@@ -153,23 +138,14 @@ fn main() -> anyhow::Result<()> {
         .open()
         .unwrap_or_else(|_| panic!("Couldn't get context for {}", device.name()));
 
-    // ---- Получение атрибутов устройства и проверка поддержки временных меток ---- ? какие есьт атрибуты у устройства?
-    let attr = context.query_device().unwrap();
-
-    if args.ts {
-        completion_timestamp_mask = attr.completion_timestamp_mask();
-        if completion_timestamp_mask == 0 {
-            panic!("The device isn't completion timestamp capable");
-        }
-    }
-
     // ---- Выделение Protection Domain (PD) - необходим для управления доступом к памяти
     let pd = context.alloc_pd().unwrap_or_else(|_| panic!("Couldn't allocate PD"));
 
     // ---- Регистрация памяти для отправки ----
-    let send_data: Vec<u8> = vec![0; args.size as _]; // буфер, который будет отправлен (payload)
+    let send_data: Vec<u8> = vec![0; args.size as _]; // выделяет в куче(heap) память размером args.size и заполняет нулями
     let send_mr = unsafe {
-        pd.reg_mr( // Memory Region, регистрирует буфер для доступа через IB
+        pd.reg_mr(
+            // Memory Region, регистрирует буфер для доступа через IB
             send_data.as_ptr() as _,
             send_data.len(),
             AccessFlags::LocalWrite | AccessFlags::RemoteWrite,
@@ -178,7 +154,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     // ---- Выделение памяти для приема ----
-    let mut recv_data: Vec<u8> = vec![0; args.size as _];
+    let mut recv_data: Vec<u8> = vec![0; args.size as _]; // выделяет в куче(heap) память размером args.size и заполняет нулями
     let recv_mr = unsafe {
         pd.reg_mr(
             recv_data.as_ptr() as _,
@@ -195,12 +171,7 @@ fn main() -> anyhow::Result<()> {
     // ---- Создание очереди событий - Completion Queue (CQ) ----
     let mut cq_builder = context.create_cq_builder();
 
-    if args.ts {
-        cq_builder.setup_wc_flags(
-            CreateCompletionQueueWorkCompletionFlags::StandardFlags
-                | CreateCompletionQueueWorkCompletionFlags::CompletionTimestamp,
-        );
-    }
+    cq_builder.setup_wc_flags(CreateCompletionQueueWorkCompletionFlags::StandardFlags);
 
     let cq = cq_builder.setup_cqe(rx_depth + 1).build_ex().unwrap(); // очередь завершения операций, куда будут приходить уведомления о завершении отправки/приёма с rx_depth + 1 элементами
 
@@ -210,38 +181,39 @@ fn main() -> anyhow::Result<()> {
 
     let mut builder = pd.create_qp_builder();
 
-    let mut qp = builder // создание QP с максимальным встроенным размером данных 128 байт, связанным с CQ для отправки и приёма
-        .setup_max_inline_data(128)
-        .setup_send_cq(cq_handle.clone())
-        .setup_recv_cq(cq_handle)
-        .setup_max_send_wr(1)
-        .setup_max_recv_wr(rx_depth)
+    let mut qp = builder // создание QP (пара очередей) с максимальным встроенным размером данных 128 байт, связанным с CQ для отправки и приёма
+        .setup_max_inline_data(128) // максимальный размер сообщения, которое может быть отправлено непосредственно в очередь отправки (в запросе на выполнение RDMA).
+        .setup_send_cq(cq_handle.clone()) // очередь завершения операций для отправки
+        .setup_recv_cq(cq_handle) // очередь завершения операций для приёма
+        .setup_max_send_wr(1) // максимальное количество запросов на отправку
+        .setup_max_recv_wr(rx_depth) // максимальное количество запросов на приём
         .build_ex()
         .unwrap_or_else(|_| panic!("Couldn't create QP"));
 
     // ---- Настройка атрибутов QP и перевод QP в состояние Init ----
     let mut attr = QueuePairAttribute::new();
     attr.setup_state(QueuePairState::Init)
-        .setup_pkey_index(0)
+        .setup_pkey_index(0) // Partition Key Index для QP - Индекс ключа раздела
         .setup_port(args.ib_port)
         .setup_access_flags(AccessFlags::LocalWrite | AccessFlags::RemoteWrite);
     qp.modify(&attr)?;
 
     // ---- Постинг приёмных запросов:Заполняет приёмную очередь запросами на приём данных. ----
     for _i in 0..rx_depth {
-        let mut guard = qp.start_post_recv();
+        let mut guard = qp.start_post_recv(); // Запускает операцию приема данных после получения, при этом каждая пара очередей должна содержать одновременно только один PostRecvGuard.
 
-        let recv_handle = guard.construct_wr(RECV_WR_ID);
+        let recv_handle = guard.construct_wr(RECV_WR_ID); // Создает новый объект RecvWorkRequestHandle для настройки нового запроса на выполнение RDMA; каждая пара очередей должна содержать только один объект RecvWorkRequestHandle одновременно.
 
         // -- Каждый запрос регистрируется с указанием буфера и его размера.
         unsafe {
             recv_handle.setup_sge(recv_mr.lkey(), recv_data.as_mut_ptr() as _, args.size);
+            // Устанавливает SGE (Segment Descriptor) для приема данных, указывая ключ доступа к памяти (lkey) и указатель на буфер для записи.
         };
 
         guard.post().unwrap();
     }
 
-    rout += rx_depth;
+    rout += rx_depth; // количество активных приёмных запросов
 
     println!(" local address: QPN {:#06x}, PSN {psn:#08x}, GID {gid}", qp.qp_number());
 
@@ -328,8 +300,6 @@ fn main() -> anyhow::Result<()> {
 
     qp.modify(&attr)?;
 
-    let clock = quanta::Clock::new();
-    let start_time = clock.now();
     let mut outstanding_send = false;
 
     if args.server_ip.is_some() {
@@ -384,31 +354,6 @@ fn main() -> anyhow::Result<()> {
                                     }
                                     rout += to_post;
                                 }
-
-                                if args.ts {
-                                    let timestamp = wc.completion_timestamp();
-                                    if ts_param.last_completion_with_timestamp != 0 {
-                                        let delta: u64 = if timestamp >= ts_param.completion_recv_prev_time {
-                                            timestamp - ts_param.completion_recv_prev_time
-                                        } else {
-                                            completion_timestamp_mask - ts_param.completion_recv_prev_time
-                                                + timestamp
-                                                + 1
-                                        };
-
-                                        ts_param.completion_recv_max_time_delta =
-                                            ts_param.completion_recv_max_time_delta.max(delta);
-                                        ts_param.completion_recv_min_time_delta =
-                                            ts_param.completion_recv_min_time_delta.min(delta);
-                                        ts_param.completion_recv_total_time_delta += delta;
-                                        ts_param.completion_with_time_iters += 1;
-                                    }
-
-                                    ts_param.completion_recv_prev_time = timestamp;
-                                    ts_param.last_completion_with_timestamp = 1;
-                                } else {
-                                    ts_param.last_completion_with_timestamp = 0;
-                                }
                             },
                             _ => {
                                 panic!("Unknown error!");
@@ -420,7 +365,8 @@ fn main() -> anyhow::Result<()> {
                             let mut guard = qp.start_post_send();
                             let send_handle = guard.construct_wr(SEND_WR_ID, WorkRequestFlags::Signaled).setup_send();
                             unsafe {
-                                send_handle.setup_sge(send_mr.lkey(), send_data.as_ptr() as _, args.size); // запись данных в SGE - это как адрес посылки
+                                send_handle.setup_sge(send_mr.lkey(), send_data.as_ptr() as _, args.size);
+                                // запись данных в SGE - это как адрес посылки
                             }
                             guard.post()?;
                             outstanding_send = true;
@@ -439,51 +385,15 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let end_time = clock.now();
-    let time = end_time.duration_since(start_time);
-    let bytes = args.size as u64 * args.iter as u64 * 2;
-    // bi-directional bandwidth
-    let bytes_per_second = bytes as f64 / time.as_secs_f64();
-    println!(
-        "{} bytes in {:.2} seconds = {:.2}/s",
-        bytes,
-        time.as_secs_f64(),
-        Byte::from_f64(bytes_per_second)
-            .unwrap()
-            .get_appropriate_unit(UnitType::Binary)
-    );
-    println!(
-        "{} iters in {:.2} seconds = {:#.2?}/iter",
-        args.iter,
-        time.as_secs_f64(),
-        time / args.iter
-    );
-
-    if args.ts && ts_param.completion_with_time_iters != 0 {
-        println!(
-            "Max receive completion clock cycles = {}",
-            ts_param.completion_recv_max_time_delta
-        );
-        println!(
-            "Min receive completion clock cycles = {}",
-            ts_param.completion_recv_min_time_delta
-        );
-        println!(
-            "Average receive completion clock cycles = {}",
-            ts_param.completion_recv_total_time_delta as f64 / ts_param.completion_with_time_iters as f64
-        );
-    }
-
     Ok(())
 }
 
-
 //--------------------------------------------------------------------------------
 
+use crossbeam_channel::{Receiver, Sender};
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use crossbeam_channel::{Sender, Receiver};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CacheEntry {
@@ -556,15 +466,16 @@ impl RdmaCache {
         }
 
         // 2. Атомарная проверка через entry-API DashMap
-        self.cache.entry(remote_entry.id)
+        self.cache
+            .entry(remote_entry.id)
             .and_modify(|local_val| {
                 // Если пришедшие данные новее — обновляем
                 if remote_entry.timestamp > local_val.timestamp {
                     *local_val = remote_entry.clone();
                 }
                 // Если таймстампы равны (редко), побеждает узел с бóльшим ID
-                else if remote_entry.timestamp == local_val.timestamp
-                        && remote_entry.origin_id > local_val.origin_id {
+                else if remote_entry.timestamp == local_val.timestamp && remote_entry.origin_id > local_val.origin_id
+                {
                     *local_val = remote_entry.clone();
                 }
             })

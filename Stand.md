@@ -145,3 +145,8 @@ cargo run --example cmtime -- -b 0.0.0.0 -p 18515 -c 10
 ```bash
 cargo run --example
 ```
+
+# Run rc_cache
+```bash
+cargo run --example rc_cache -- -d rxe0 -i 1
+```
