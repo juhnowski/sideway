@@ -119,12 +119,12 @@ struct TimeStamps {
 
 #[allow(clippy::while_let_on_iterator)] // отключает предупреждение линтера о нерекомендуемом использовании while let на итераторах.
 fn main() -> anyhow::Result<()> {
-
     // ---- Парсинг аргументов и инициализация счётчиков  ----
     let args = Args::parse(); // парсит аргументы командной строки
     let mut scnt: u32 = 0; // счётчики для отправленных пакетов
     let mut rcnt: u32 = 0; // счётчики для полученных пакетов
-    let rx_depth = if args.iter > args.rx_depth { //глубина приёмного буфера (сколько запросов на приём можно держать в очереди)
+    let rx_depth = if args.iter > args.rx_depth {
+        //глубина приёмного буфера (сколько запросов на приём можно держать в очереди)
         args.rx_depth
     } else {
         args.iter
@@ -132,7 +132,8 @@ fn main() -> anyhow::Result<()> {
     let mut rout: u32 = 0; // количество активных приёмных запросов
 
     // ---- Инициализация структуры для хранения временных меток ----
-    let mut ts_param = TimeStamps { // структура для хранения статистики по временным меткам
+    let mut ts_param = TimeStamps {
+        // структура для хранения статистики по временным меткам
         completion_recv_min_time_delta: u64::MAX, // минимальное время между приёмными запросами
         ..Default::default()
     };
@@ -140,7 +141,8 @@ fn main() -> anyhow::Result<()> {
 
     // ---- Получение списка устройств InfiniBand ----
     let device_list = DeviceList::new().expect("Failed to get IB devices list"); // Получает список IB-устройств.
-    let device = match args.ib_dev { //Если указано имя устройства (args.ib_dev), ищет его, иначе берёт первое доступное.
+    let device = match args.ib_dev {
+        //Если указано имя устройства (args.ib_dev), ищет его, иначе берёт первое доступное.
         Some(ib_dev) => device_list
             .iter()
             .find(|dev| dev.name().eq(&ib_dev))
@@ -169,7 +171,8 @@ fn main() -> anyhow::Result<()> {
     // ---- Регистрация памяти для отправки ----
     let send_data: Vec<u8> = vec![0; args.size as _]; // буфер, который будет отправлен (payload)
     let send_mr = unsafe {
-        pd.reg_mr( // Memory Region, регистрирует буфер для доступа через IB
+        pd.reg_mr(
+            // Memory Region, регистрирует буфер для доступа через IB
             send_data.as_ptr() as _,
             send_data.len(),
             AccessFlags::LocalWrite | AccessFlags::RemoteWrite,
@@ -420,7 +423,8 @@ fn main() -> anyhow::Result<()> {
                             let mut guard = qp.start_post_send();
                             let send_handle = guard.construct_wr(SEND_WR_ID, WorkRequestFlags::Signaled).setup_send();
                             unsafe {
-                                send_handle.setup_sge(send_mr.lkey(), send_data.as_ptr() as _, args.size); // запись данных в SGE - это как адрес посылки
+                                send_handle.setup_sge(send_mr.lkey(), send_data.as_ptr() as _, args.size);
+                                // запись данных в SGE - это как адрес посылки
                             }
                             guard.post()?;
                             outstanding_send = true;
@@ -477,101 +481,100 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+// //--------------------------------------------------------------------------------
 
-//--------------------------------------------------------------------------------
+// use dashmap::DashMap;
+// use std::sync::Arc;
+// use std::time::{SystemTime, UNIX_EPOCH};
+// use crossbeam_channel::{Sender, Receiver};
 
-use dashmap::DashMap;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-use crossbeam_channel::{Sender, Receiver};
+// #[derive(Clone, Debug, PartialEq)]
+// pub struct CacheEntry {
+//     pub id: u64,
+//     pub payload: Vec<u8>,
+//     pub origin_id: u32,
+//     pub timestamp: u128, // Время создания записи в наносекундах
+// }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct CacheEntry {
-    pub id: u64,
-    pub payload: Vec<u8>,
-    pub origin_id: u32,
-    pub timestamp: u128, // Время создания записи в наносекундах
-}
+// pub struct RdmaCache {
+//     pub cache: DashMap<u64, CacheEntry>,
+//     tx_send: Sender<CacheEntry>,
+//     local_node_id: u32,
+// }
 
-pub struct RdmaCache {
-    pub cache: DashMap<u64, CacheEntry>,
-    tx_send: Sender<CacheEntry>,
-    local_node_id: u32,
-}
+// impl RdmaCache {
+//     pub fn new(local_node_id: u32, tx_send: Sender<CacheEntry>) -> Self {
+//         Self {
+//             cache: DashMap::new(),
+//             tx_send,
+//             local_node_id,
+//         }
+//     }
 
-impl RdmaCache {
-    pub fn new(local_node_id: u32, tx_send: Sender<CacheEntry>) -> Self {
-        Self {
-            cache: DashMap::new(),
-            tx_send,
-            local_node_id,
-        }
-    }
+//     fn get_now() -> u128 {
+//         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+//     }
 
-    fn get_now() -> u128 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
-    }
+//     /// Локальная вставка: всегда обновляем и рассылаем
+//     pub fn insert(&self, key: u64, payload: Vec<u8>) {
+//         let entry = CacheEntry {
+//             id: key,
+//             payload,
+//             origin_id: self.local_node_id,
+//             timestamp: Self::get_now(),
+//         };
 
-    /// Локальная вставка: всегда обновляем и рассылаем
-    pub fn insert(&self, key: u64, payload: Vec<u8>) {
-        let entry = CacheEntry {
-            id: key,
-            payload,
-            origin_id: self.local_node_id,
-            timestamp: Self::get_now(),
-        };
+//         self.cache.insert(key, entry.clone());
+//         let _ = self.tx_send.send(entry);
+//     }
 
-        self.cache.insert(key, entry.clone());
-        let _ = self.tx_send.send(entry);
-    }
+//     /// Локальная вставка: записывает и рассылает ТОЛЬКО если ключа еще нет
+//     pub fn insert_if_absent(&self, key: u64, payload: Vec<u8>) {
+//         // Проверяем наличие ключа и вставляем атомарно, если его нет
+//         let mut was_inserted = false;
 
-    /// Локальная вставка: записывает и рассылает ТОЛЬКО если ключа еще нет
-    pub fn insert_if_absent(&self, key: u64, payload: Vec<u8>) {
-        // Проверяем наличие ключа и вставляем атомарно, если его нет
-        let mut was_inserted = false;
+//         self.cache.entry(key).or_insert_with(|| {
+//             was_inserted = true;
+//             CacheEntry {
+//                 id: key,
+//                 payload,
+//                 origin_id: self.local_node_id,
+//                 timestamp: Self::get_now(),
+//             }
+//         });
 
-        self.cache.entry(key).or_insert_with(|| {
-            was_inserted = true;
-            CacheEntry {
-                id: key,
-                payload,
-                origin_id: self.local_node_id,
-                timestamp: Self::get_now(),
-            }
-        });
+//         // Рассылаем в сеть только если запись действительно была создана сейчас
+//         if was_inserted {
+//             if let Some(entry) = self.cache.get(&key) {
+//                 let _ = self.tx_send.send(entry.clone());
+//             }
+//         }
+//     }
 
-        // Рассылаем в сеть только если запись действительно была создана сейчас
-        if was_inserted {
-            if let Some(entry) = self.cache.get(&key) {
-                let _ = self.tx_send.send(entry.clone());
-            }
-        }
-    }
+//     /// Обработка входящих данных с разрешением конфликтов
+//     pub fn process_incoming(&self, remote_entry: CacheEntry) {
+//         // 1. Фильтрация эха
+//         if remote_entry.origin_id == self.local_node_id {
+//             return;
+//         }
 
-    /// Обработка входящих данных с разрешением конфликтов
-    pub fn process_incoming(&self, remote_entry: CacheEntry) {
-        // 1. Фильтрация эха
-        if remote_entry.origin_id == self.local_node_id {
-            return;
-        }
+//         // 2. Атомарная проверка через entry-API DashMap
+//         self.cache.entry(remote_entry.id)
+//             .and_modify(|local_val| {
+//                 // Если пришедшие данные новее — обновляем
+//                 if remote_entry.timestamp > local_val.timestamp {
+//                     *local_val = remote_entry.clone();
+//                 }
+//                 // Если таймстампы равны (редко), побеждает узел с бóльшим ID
+//                 else if remote_entry.timestamp == local_val.timestamp
+//                         && remote_entry.origin_id > local_val.origin_id {
+//                     *local_val = remote_entry.clone();
+//                 }
+//             })
+//             .or_insert(remote_entry); // Если ключа нет — просто вставляем
+//     }
+// }
 
-        // 2. Атомарная проверка через entry-API DashMap
-        self.cache.entry(remote_entry.id)
-            .and_modify(|local_val| {
-                // Если пришедшие данные новее — обновляем
-                if remote_entry.timestamp > local_val.timestamp {
-                    *local_val = remote_entry.clone();
-                }
-                // Если таймстампы равны (редко), побеждает узел с бóльшим ID
-                else if remote_entry.timestamp == local_val.timestamp
-                        && remote_entry.origin_id > local_val.origin_id {
-                    *local_val = remote_entry.clone();
-                }
-            })
-            .or_insert(remote_entry); // Если ключа нет — просто вставляем
-    }
-}
-
-// два подхода:
-// 1. Один раз положили в DashMap и не обновляем insert_if_absent
-// 2. Обновляем при каждом входящем запросе
+// // два подхода:
+// // 1. Один раз положили в DashMap и не обновляем insert_if_absent
+// // 2. Обновляем при каждом входящем запросе

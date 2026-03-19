@@ -384,8 +384,7 @@ pub trait QueuePair {
     //
     fn start_post_send(&mut self) -> Self::Guard<'_>;
 
-    /// Starts a post receive operation, every [`QueuePair`] should hold only one [`PostRecvGuard`]
-    /// at the same time.
+    /// Запускает операцию приема после получения, каждая [`QueuePair`] должна содержать только один [`PostRecvGuard`]
     ///
     /// # Example
     ///

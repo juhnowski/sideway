@@ -35,7 +35,7 @@ use byte_unit::{Byte, UnitType};
 const SEND_WR_ID: u64 = 0;
 const RECV_WR_ID: u64 = 1;
 
-const CHUNK_SIZE: usize = 4096;
+const CHUNK_SIZE: u32 = 4096;
 
 #[derive(Debug, Parser)]
 #[clap(name = "rc_cache", version = "0.1.0")]
@@ -383,16 +383,16 @@ fn main() -> anyhow::Result<()> {
                             outstanding_send = true;
                         }
                         // ----------------------------------------------------------------------------------------------------------------------------
-                        if rcnt < args.iter {
-                            // Постинг запросов на получение (post_recv)
-                            let mut guard = qp.start_post_recv();
-                            let recv_handle = guard.construct_wr(RECV_WR_ID, WorkRequestFlags::Signaled).setup_recv();
+                        if scnt < args.iter && !outstanding_send {
+                            // Постинг запросов на отправку (post_send)
+                            let mut guard = qp.start_post_send();
+                            let send_handle = guard.construct_wr(SEND_WR_ID, WorkRequestFlags::Signaled).setup_send();
                             unsafe {
-                                recv_handle.setup_sge(recv_mr.lkey(), recv_data.as_ptr() as _, args.size);
-                                // запись данных в SGE - это как адрес получения
+                                send_handle.setup_sge(send_mr.lkey(), send_data.as_ptr() as _, args.size);
+                                // запись данных в SGE - это как адрес посылки
                             }
                             guard.post()?;
-                            rout += 1;
+                            outstanding_send = true;
                         }
                     }
                 },

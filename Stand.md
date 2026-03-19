@@ -147,6 +147,11 @@ cargo run --example
 ```
 
 # Run rc_cache
+## Therminal 3
 ```bash
 cargo run --example rc_cache -- -d rxe0 -i 1
+```
+## Therminal 4
+```bash
+cargo run --example rc_cache -- -d rxe0 -i 1 10.0.0.1
 ```
