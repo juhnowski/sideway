@@ -143,7 +143,7 @@ cargo run --example cmtime -- -b 0.0.0.0 -p 18515 -c 10
 
  # Run example ibv_devinfo
 ```bash
-cargo run --example
+cargo run --example ibv_devinfo
 ```
 
 # Run rc_cache

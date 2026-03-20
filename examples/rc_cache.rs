@@ -14,7 +14,11 @@
 use std::io::{Error, Read, Write};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
+use std::thread;
 
 use clap::{Parser, ValueEnum};
 use postcard::{from_bytes, to_allocvec};
@@ -25,13 +29,38 @@ use sideway::ibverbs::completion::{
 };
 use sideway::ibverbs::device::{DeviceInfo, DeviceList};
 use sideway::ibverbs::device_context::Mtu;
+use sideway::ibverbs::memory_region;
+use sideway::ibverbs::memory_region::MemoryRegion;
 use sideway::ibverbs::queue_pair::{
-    PostSendGuard, QueuePair, QueuePairAttribute, QueuePairState, SetScatterGatherEntry, WorkRequestFlags,
+    ExtendedQueuePair, PostSendGuard, QueuePair, QueuePairAttribute, QueuePairState, SetScatterGatherEntry,
+    WorkRequestFlags,
 };
 use sideway::ibverbs::AccessFlags;
 
-use byte_unit::{Byte, UnitType};
-
+struct PollContext {
+    /// Очередь завершения операций (Completion Queue)
+    cq: GenericCompletionQueue,
+    /// Пара очередей (Queue Pair) для отправки/приёма
+    qp: Arc<Mutex<ExtendedQueuePair>>,
+    /// Регион памяти для отправки
+    send_mr: Arc<MemoryRegion>,
+    /// Регион памяти для приёма
+    recv_mr: Arc<MemoryRegion>,
+    /// Буфер данных для отправки
+    send_data: Vec<u8>,
+    /// Буфер данных для приёма (защищён мьютексом)
+    recv_data: Arc<Mutex<Vec<u8>>>,
+    /// Счётчик отправленных пакетов
+    scnt: Arc<Mutex<u32>>,
+    /// Счётчик полученных пакетов
+    rcnt: Arc<Mutex<u32>>,
+    /// Количество активных приёмных запросов
+    rout: Arc<Mutex<u32>>,
+    /// Аргументы командной строки
+    args: Args,
+    /// Флаг завершения работы
+    done: Arc<AtomicBool>,
+}
 const SEND_WR_ID: u64 = 0;
 const RECV_WR_ID: u64 = 1;
 
@@ -56,10 +85,10 @@ pub struct Args {
     #[clap(long, short = 'm', value_enum, default_value_t = PathMtu(Mtu::Mtu1024))]
     mtu: PathMtu,
     /// Количество сообщений, которые можно отправить за один раз.
-    #[clap(long, short = 'r', default_value_t = 500)]
+    #[clap(long, short = 'r', default_value_t = 3)]
     rx_depth: u32,
     /// Глубина приёмного буфера
-    #[clap(long, short = 'n', default_value_t = 500)]
+    #[clap(long, short = 'n', default_value_t = 3)]
     iter: u32,
     /// Service level value
     #[clap(long, short = 'l', default_value_t = 0)]
@@ -101,7 +130,7 @@ impl ValueEnum for PathMtu {
 }
 
 #[derive(Deserialize, Serialize, Debug)]
-struct PingPongDestination {
+struct SyncDestination {
     lid: u32,
     qp_number: u32,
     packet_seq_number: u32,
@@ -112,8 +141,8 @@ struct PingPongDestination {
 fn main() -> anyhow::Result<()> {
     // ---- Парсинг аргументов и инициализация счётчиков  ----
     let args = Args::parse(); // парсит аргументы командной строки
-    let mut scnt: u32 = 0; // счётчики для отправленных пакетов
-    let mut rcnt: u32 = 0; // счётчики для полученных пакетов
+                              //  let mut scnt: u32 = 0; // счётчики для отправленных пакетов
+                              //  let mut rcnt: u32 = 0; // счётчики для полученных пакетов
     let rx_depth = if args.iter > args.rx_depth {
         //глубина приёмного буфера (сколько запросов на приём можно держать в очереди)
         args.rx_depth
@@ -126,9 +155,9 @@ fn main() -> anyhow::Result<()> {
     let device_list = DeviceList::new().expect("Failed to get IB devices list"); // Получает список IB-устройств.
     let device = match args.ib_dev {
         //Если указано имя устройства (args.ib_dev), ищет его, иначе берёт первое доступное.
-        Some(ib_dev) => device_list
+        Some(ref ib_dev) => device_list
             .iter()
-            .find(|dev| dev.name().eq(&ib_dev))
+            .find(|dev| dev.name().as_str() == ib_dev.as_str())
             .unwrap_or_else(|| panic!("IB device {ib_dev} not found")),
         None => device_list.iter().next().expect("No IB device found"),
     };
@@ -145,7 +174,6 @@ fn main() -> anyhow::Result<()> {
     let send_data: Vec<u8> = vec![0; args.size as _]; // выделяет в куче(heap) память размером args.size и заполняет нулями
     let send_mr = unsafe {
         pd.reg_mr(
-            // Memory Region, регистрирует буфер для доступа через IB
             send_data.as_ptr() as _,
             send_data.len(),
             AccessFlags::LocalWrite | AccessFlags::RemoteWrite,
@@ -184,7 +212,7 @@ fn main() -> anyhow::Result<()> {
     let mut qp = builder // создание QP (пара очередей) с максимальным встроенным размером данных 128 байт, связанным с CQ для отправки и приёма
         .setup_max_inline_data(128) // максимальный размер сообщения, которое может быть отправлено непосредственно в очередь отправки (в запросе на выполнение RDMA).
         .setup_send_cq(cq_handle.clone()) // очередь завершения операций для отправки
-        .setup_recv_cq(cq_handle) // очередь завершения операций для приёма
+        .setup_recv_cq(cq_handle.clone()) // очередь завершения операций для приёма
         .setup_max_send_wr(1) // максимальное количество запросов на отправку
         .setup_max_recv_wr(rx_depth) // максимальное количество запросов на приём
         .build_ex()
@@ -233,7 +261,8 @@ fn main() -> anyhow::Result<()> {
     };
 
     // ---- Отправка и получение контекста через TCP  ----
-    let send_context = |stream: &mut TcpStream, dest: &PingPongDestination| {
+    let send_context = |stream: &mut TcpStream, dest: &SyncDestination| {
+        println!("Sending context to {:?}", dest);
         let msg_buf = to_allocvec(dest).unwrap();
         let size = msg_buf.len().to_be_bytes();
         stream.write_all(&size)?;
@@ -249,12 +278,12 @@ fn main() -> anyhow::Result<()> {
         msg_buf.clear();
         msg_buf.resize(usize::from_be_bytes(size), 0);
         stream.read_exact(&mut *msg_buf)?;
-        let dest: PingPongDestination = from_bytes(msg_buf).unwrap();
-
-        Ok::<PingPongDestination, Error>(dest)
+        let dest: SyncDestination = from_bytes(msg_buf).unwrap();
+        println!("Received context from {:?}", dest);
+        Ok::<SyncDestination, Error>(dest)
     };
 
-    let local_context = PingPongDestination {
+    let local_context = SyncDestination {
         lid: 1,
         qp_number: qp.qp_number(),
         packet_seq_number: psn,
@@ -314,99 +343,28 @@ fn main() -> anyhow::Result<()> {
         guard.post()?;
         outstanding_send = true;
     }
-    // Основной цикл опроса CQ и обработки завершённых операций
-    {
-        loop {
-            match cq.start_poll() {
-                Ok(mut poller) => {
-                    while let Some(wc) = poller.next() {
-                        if wc.status() != WorkCompletionStatus::Success as u32 {
-                            panic!(
-                                "Failed status {:#?} ({}) for wr_id {}",
-                                Into::<WorkCompletionStatus>::into(wc.status()),
-                                wc.status(),
-                                wc.wr_id()
-                            );
-                        }
-                        match wc.wr_id() {
-                            SEND_WR_ID => {
-                                scnt += 1;
-                                outstanding_send = false;
-                                println!("[SEND] Packet sent, total: {}", scnt);
+    let done = Arc::new(AtomicBool::new(false));
+    let ctx = PollContext {
+        cq: cq_handle, // Передаём GenericCompletionQueue
+        qp: Arc::new(Mutex::new(qp)),
+        send_mr,
+        recv_mr,
+        send_data,
+        recv_data: Arc::new(Mutex::new(recv_data)),
+        scnt: Arc::new(Mutex::new(0)),
+        rcnt: Arc::new(Mutex::new(0)),
+        rout: Arc::new(Mutex::new(rout)),
+        args,
+        done: done.clone(),
+    };
 
-                                log_hex(&send_data, 20);
-                            },
-                            RECV_WR_ID => {
-                                rcnt += 1;
-                                rout -= 1;
-
-                                // Логируем полученные байты (например, первые 20 байт)
-                                // println!(
-                                //     "[RECV] Raw data (len={}): {:?}",
-                                //     args.size,
-                                //     &recv_data[..20.min(recv_data.len())]
-                                // );
-                                log_hex(&recv_data, 20);
-
-                                // Разместить больше получателей, если кредит на стороне получателя невелик
-                                if rout <= rx_depth / 2 {
-                                    let to_post = rx_depth - rout;
-                                    for _ in 0..to_post {
-                                        let mut guard = qp.start_post_recv();
-                                        let recv_handle = guard.construct_wr(RECV_WR_ID);
-                                        unsafe {
-                                            recv_handle.setup_sge(
-                                                recv_mr.lkey(),
-                                                recv_data.as_mut_ptr() as _,
-                                                args.size,
-                                            );
-                                        };
-                                        guard.post().unwrap();
-                                    }
-                                    rout += to_post;
-                                }
-                            },
-                            _ => {
-                                panic!("Unknown error!");
-                            },
-                        }
-                        // отправка -----------------------------------------------------------------------------------------------------------------
-                        if scnt < args.iter && !outstanding_send {
-                            // Постинг запросов на отправку (post_send)
-                            let mut guard = qp.start_post_send();
-                            let send_handle = guard.construct_wr(SEND_WR_ID, WorkRequestFlags::Signaled).setup_send();
-                            unsafe {
-                                send_handle.setup_sge(send_mr.lkey(), send_data.as_ptr() as _, args.size);
-                                // запись данных в SGE - это как адрес посылки
-                            }
-                            guard.post()?;
-                            outstanding_send = true;
-                        }
-                        // ----------------------------------------------------------------------------------------------------------------------------
-                        if scnt < args.iter && !outstanding_send {
-                            // Постинг запросов на отправку (post_send)
-                            let mut guard = qp.start_post_send();
-                            let send_handle = guard.construct_wr(SEND_WR_ID, WorkRequestFlags::Signaled).setup_send();
-                            unsafe {
-                                send_handle.setup_sge(send_mr.lkey(), send_data.as_ptr() as _, args.size);
-                                // запись данных в SGE - это как адрес посылки
-                            }
-                            guard.post()?;
-                            outstanding_send = true;
-                        }
-                    }
-                },
-                Err(_) => {
-                    continue;
-                },
-            }
-
-            // Check if we're done
-            if scnt >= args.iter && rcnt >= args.iter {
-                break;
-            }
+    let handle = thread::spawn(move || {
+        if let Err(e) = poll_cq_thread(ctx) {
+            eprintln!("Poll thread error: {}", e);
         }
-    }
+    });
+
+    handle.join().unwrap();
 
     Ok(())
 }
@@ -417,4 +375,83 @@ fn log_hex(data: &[u8], max_len: usize) {
         "HEX: {}",
         (0..len).map(|i| format!("{:02x} ", data[i])).collect::<String>()
     );
+}
+
+//--------------------------------------
+fn poll_cq_thread(ctx: PollContext) -> anyhow::Result<()> {
+    let mut outstanding_send = false;
+    while !ctx.done.load(Ordering::Relaxed) {
+        match ctx.cq.start_poll() {
+            Ok(mut poller) => {
+                while let Some(wc) = poller.next() {
+                    if wc.status() != WorkCompletionStatus::Success as u32 {
+                        panic!(
+                            "Failed status {:#?} ({}) for wr_id {}",
+                            Into::<WorkCompletionStatus>::into(wc.status()),
+                            wc.status(),
+                            wc.wr_id()
+                        );
+                    }
+                    match wc.wr_id() {
+                        SEND_WR_ID => {
+                            let mut scnt = ctx.scnt.lock().unwrap();
+                            *scnt += 1;
+                            outstanding_send = false;
+                            println!("[SEND] Packet sent, total: {}", *scnt);
+                            log_hex(&ctx.send_data, 20);
+                        },
+                        RECV_WR_ID => {
+                            let mut rcnt = ctx.rcnt.lock().unwrap();
+                            let mut rout = ctx.rout.lock().unwrap();
+                            *rcnt += 1;
+                            *rout -= 1;
+                            println!("[RECV] Packet received, total: {}", *rcnt);
+                            let recv_data = ctx.recv_data.lock().unwrap();
+                            log_hex(&*recv_data, 20);
+                            if *rout <= ctx.args.rx_depth / 2 {
+                                let to_post = ctx.args.rx_depth - *rout;
+                                let mut qp = ctx.qp.lock().unwrap();
+                                for _ in 0..to_post {
+                                    let mut guard = qp.start_post_recv();
+                                    let recv_handle = guard.construct_wr(RECV_WR_ID);
+                                    unsafe {
+                                        recv_handle.setup_sge(
+                                            ctx.recv_mr.lkey(),
+                                            ctx.recv_data.lock().unwrap().as_mut_ptr() as _,
+                                            ctx.args.size,
+                                        );
+                                    };
+                                    guard.post().unwrap();
+                                }
+                                *rout += to_post;
+                            }
+                        },
+                        _ => panic!("Unknown error!"),
+                    }
+                    let scnt = *ctx.scnt.lock().unwrap();
+                    let rcnt = *ctx.rcnt.lock().unwrap();
+                    if scnt < ctx.args.iter && !outstanding_send {
+                        let mut qp = ctx.qp.lock().unwrap();
+                        let mut guard = qp.start_post_send();
+                        let send_handle = guard.construct_wr(SEND_WR_ID, WorkRequestFlags::Signaled).setup_send();
+                        unsafe {
+                            send_handle.setup_sge(ctx.send_mr.lkey(), ctx.send_data.as_ptr() as _, ctx.args.size);
+                        }
+                        guard.post()?;
+                        outstanding_send = true;
+                    }
+                }
+            },
+            Err(_) => {
+                continue;
+            },
+        }
+        let scnt = *ctx.scnt.lock().unwrap();
+        let rcnt = *ctx.rcnt.lock().unwrap();
+        if scnt >= ctx.args.iter && rcnt >= ctx.args.iter {
+            ctx.done.store(true, Ordering::Relaxed);
+            break;
+        }
+    }
+    Ok(())
 }
